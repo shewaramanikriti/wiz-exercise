@@ -257,18 +257,21 @@ Resources:
             echo "== W1 (intentional): disable automatic OS patching =="
             systemctl stop unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
             systemctl disable unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
-            while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 5; done
+            # Boot-time apt jobs (cloud-init, apt-daily) can hold the dpkg lock:
+            # wait for it rather than fail. Lock::Timeout covers races after the loop.
+            APT="apt-get -y -o DPkg::Lock::Timeout=900"
+            while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 5; done
 
-            apt-get update -y
-            apt-get install -y gnupg curl jq awscli
+            $APT update
+            $APT install gnupg curl jq awscli
 
             echo "== W4 (intentional): install MongoDB $MONGO_VERSION =="
             curl -fsSL "https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc" \
-              | gpg --dearmor -o "/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg"
+              | gpg --batch --yes --dearmor -o "/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg"
             echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/$MONGO_VERSION multiverse" \
               > "/etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list"
-            apt-get update -y
-            apt-get install -y mongodb-org
+            $APT update
+            $APT install mongodb-org
             dpkg-query -W -f='${!Package}\n' 'mongodb-org*' | xargs apt-mark hold
 
             # Auth enabled from first start; the first user is created through the

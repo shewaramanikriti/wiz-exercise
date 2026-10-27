@@ -27,6 +27,14 @@ Parameters:
     Type: String
     Default: production
     Description: GitHub environment the deploy jobs run in (enables required reviewers)
+  GitHubSubjectPrefix:
+    Type: String
+    Default: ""
+    Description: >-
+      Repos using GitHub's immutable subject claims send IDs, e.g.
+      repo:owner@123/repo@456. Get it with:
+      gh api repos/<org>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix
+      Leave empty for the classic name-based subject.
   CreateOidcProvider:
     Type: String
     Default: "true"
@@ -35,6 +43,7 @@ Parameters:
 
 Conditions:
   MakeProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  ImmutableSubject: !Not [!Equals [!Ref GitHubSubjectPrefix, ""]]
 
 Resources:
   GitHubOidcProvider:
@@ -52,9 +61,12 @@ Resources:
     Metadata:
       com.aws.cloudformation.Context:
         why: >-
-          Pipelines create VPCs, IAM roles, EKS and security services, so the
-          lab uses AdministratorAccess. Blast radius is limited by the trust
-          policy (one repo, one protected environment) rather than by permissions.
+          With an immutable subject the trust is pinned to the repo's numeric
+          IDs, so a deleted-and-recreated repo with the same name (repojacking)
+          cannot assume the role. Pipelines create VPCs, IAM roles, EKS and
+          security services, so the lab uses AdministratorAccess. Blast radius
+          is limited by the trust policy (one repo, one protected environment)
+          rather than by permissions.
         must:
           - Never widen the sub condition to a wildcard repo or branch.
     Properties:
@@ -74,7 +86,10 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironment}"
+                token.actions.githubusercontent.com:sub: !If
+                  - ImmutableSubject
+                  - !Sub "${GitHubSubjectPrefix}:environment:${GitHubEnvironment}"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironment}"
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
 

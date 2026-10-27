@@ -2,7 +2,7 @@
 # Pre-demo check: confirms every INTENTIONAL weakness the exercise requires is
 # live, and every REQUIRED restriction is in place. Read-only; changes nothing.
 # Usage: PROJECT=wiz AWS_REGION=us-east-1 ./scripts/verify-weaknesses.sh
-set -uo pipefail
+set -u   # no pipefail: checks are judged by the final grep
 PROJECT="${PROJECT:-wiz}"; export AWS_REGION="${AWS_REGION:-us-east-1}"
 out() { aws cloudformation describe-stacks --stack-name "$PROJECT-$1" \
           --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text; }
@@ -23,7 +23,7 @@ check "Automatic OS patching disabled"               "$SSH 'systemctl is-enabled
 check "SSH (22) open to 0.0.0.0/0 in security group" "aws ec2 describe-security-groups --group-ids $SG --query \"SecurityGroups[0].IpPermissions[?FromPort==\\\`22\\\`].IpRanges[].CidrIp\" --output text | grep -q '0.0.0.0/0'"
 check "SSH reachable from the internet"              "nc -z -w 5 $IP 22"
 check "VM role has an Action:* (admin-level) policy" "aws iam get-policy-version --policy-arn \$(aws iam list-attached-role-policies --role-name $ROLE --query \"AttachedPolicies[?contains(PolicyName,'overly-permissive')].PolicyArn\" --output text) --version-id v1 --query 'PolicyVersion.Document.Statement[0].Action' --output text | grep -qx '\*'"
-check "VM role can create VMs (dry-run succeeds)"    "$SSH 'T=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\"); M(){ curl -s -H \"X-aws-ec2-metadata-token: \$T\" http://169.254.169.254/latest/meta-data/\$1; }; aws ec2 run-instances --dry-run --image-id \$(M ami-id) --instance-type t3.micro --subnet-id \$(M network/interfaces/macs/\$(M mac)/subnet-id) 2>&1' | grep -q DryRunOperation"
+check "VM role can create VMs (dry-run succeeds)"    "$SSH 'export AWS_DEFAULT_REGION=$AWS_REGION; T=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\"); M(){ curl -s -H \"X-aws-ec2-metadata-token: \$T\" http://169.254.169.254/latest/meta-data/\$1; }; aws ec2 run-instances --dry-run --image-id \$(M ami-id) --instance-type t3.micro --subnet-id \$(M network/interfaces/macs/\$(M mac)/subnet-id) 2>&1' | grep -q DryRunOperation"
 check "MongoDB is an EOL version (< 7.0)"           "$SSH 'mongod --version' | grep -Eq 'db version v(4\.|5\.|6\.)'"
 check "Daily backup cron job present"                "$SSH 'cat /etc/cron.d/mongo-backup' | grep -q mongo-backup.sh"
 check "Backup object exists in S3"                   "aws s3 ls s3://$BUCKET/backups/ | grep -q archive.gz"

@@ -1,0 +1,32 @@
+name: teardown
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type DESTROY to delete every exercise stack
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT: ${{ vars.PROJECT_NAME || 'wiz' }}
+
+jobs:
+  teardown:
+    if: github.event.inputs.confirm == 'DESTROY'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+      - run: bash scripts/teardown.sh

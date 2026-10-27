@@ -1,0 +1,187 @@
+name: app
+
+# Pipeline 2: build the Tasky container, prove wizexercise.txt is inside it,
+# scan it, push to ECR and roll it out to EKS.
+
+on:
+  pull_request:
+    paths: [app/**, k8s/**, .github/workflows/app.yml]
+  push:
+    branches: [main]
+    paths: [app/**, k8s/**, .github/workflows/app.yml]
+  workflow_dispatch:
+  workflow_run:                 # redeploy automatically once infrastructure is up
+    workflows: [iac]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT: ${{ vars.PROJECT_NAME || 'wiz' }}
+  LOCAL_IMAGE: tasky:${{ github.sha }}
+
+jobs:
+  build-scan:
+    name: Build, verify, scan
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Guard - candidate name must be set
+        run: |
+          if grep -q "REPLACE WITH YOUR FULL NAME" app/wizexercise.txt; then
+            echo "::error file=app/wizexercise.txt::Put your name in app/wizexercise.txt"; exit 1
+          fi
+          test -f app/src/go.mod || { echo "::error::Run scripts/vendor-tasky.sh and commit app/src"; exit 1; }
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: app/Dockerfile
+          failure-threshold: error
+
+      - name: Build image
+        run: docker build -t "$LOCAL_IMAGE" app/
+
+      - name: Verify wizexercise.txt is in the image
+        run: |
+          echo "Contents of /app/wizexercise.txt in $LOCAL_IMAGE:"
+          docker run --rm --entrypoint cat "$LOCAL_IMAGE" /app/wizexercise.txt
+
+      - name: Trivy - report all findings to code scanning
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "0"
+
+      - name: Upload Trivy results
+        if: always()
+        continue-on-error: true   # code scanning needs a public repo or GitHub Advanced Security
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Trivy - gate on fixable CRITICAL vulnerabilities
+        if: vars.TRIVY_ENFORCE != 'false'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      - name: Save image for the deploy job
+        if: github.event_name != 'pull_request'
+        run: docker save "$LOCAL_IMAGE" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name != 'pull_request'
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: Push to ECR and deploy to EKS
+    needs: build-scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Read stack outputs
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$PROJECT-eks" >/dev/null 2>&1; then
+            echo "::error::Stack $PROJECT-eks not found. Infrastructure isn't deployed yet; this workflow re-runs automatically when 'iac' succeeds."
+            exit 1
+          fi
+          out() { aws cloudformation describe-stacks --stack-name "$1" \
+                    --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text; }
+          {
+            echo "REPO_URI=$(out "$PROJECT-eks" RepositoryUri)"
+            echo "CLUSTER=$(out "$PROJECT-eks" ClusterName)"
+            echo "MONGO_IP=$(out "$PROJECT-mongodb" MongoPrivateIp)"
+            echo "MONGO_SECRET_ARN=$(out "$PROJECT-mongodb" MongoSecretArn)"
+            echo "JWT_SECRET_ARN=$(out "$PROJECT-mongodb" AppJwtSecretArn)"
+          } >> "$GITHUB_ENV"
+
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Push image (immutable tag = git SHA)
+        run: |
+          IMAGE="$REPO_URI:${{ github.sha }}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          if aws ecr describe-images --repository-name "$PROJECT/tasky" \
+               --image-ids imageTag="${{ github.sha }}" >/dev/null 2>&1; then
+            echo "Tag ${{ github.sha }} already in ECR (immutable) - reusing it"
+          else
+            docker load < image.tar.gz
+            docker tag "$LOCAL_IMAGE" "$IMAGE"
+            docker push "$IMAGE"
+          fi
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER"
+
+      - name: Create/refresh the MongoDB connection Secret
+        run: |
+          kubectl apply -f k8s/00-namespace.yaml
+          CREDS=$(aws secretsmanager get-secret-value --secret-id "$MONGO_SECRET_ARN" --query SecretString --output text)
+          DB_USER=$(jq -r .username <<<"$CREDS"); DB_PASS=$(jq -r .password <<<"$CREDS")
+          JWT=$(aws secretsmanager get-secret-value --secret-id "$JWT_SECRET_ARN" --query SecretString --output text)
+          echo "::add-mask::$DB_PASS"; echo "::add-mask::$JWT"
+          kubectl -n tasky create secret generic tasky-secrets \
+            --from-literal=MONGODB_URI="mongodb://$DB_USER:$DB_PASS@$MONGO_IP:27017/go-mongodb?authSource=admin" \
+            --from-literal=SECRET_KEY="$JWT" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply manifests
+        run: |
+          mkdir -p rendered && cp k8s/*.yaml rendered/
+          sed -i "s#IMAGE_PLACEHOLDER#$IMAGE#" rendered/30-deployment.yaml
+          kubectl apply -f rendered/
+          kubectl -n tasky rollout status deploy/tasky --timeout=10m
+
+      - name: Verify wizexercise.txt in the RUNNING container
+        run: kubectl -n tasky exec deploy/tasky -- cat /app/wizexercise.txt
+
+      - name: Wait for the ALB
+        run: |
+          for i in $(seq 1 60); do
+            HOST=$(kubectl -n tasky get ingress tasky -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$HOST" ] && break; sleep 10
+          done
+          echo "### Tasky is live: http://$HOST" >> "$GITHUB_STEP_SUMMARY"
+          echo "App URL: http://$HOST"

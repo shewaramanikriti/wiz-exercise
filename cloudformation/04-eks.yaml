@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Wiz exercise - application tier. EKS Auto Mode cluster whose nodes run only
+  in the private subnets, with built-in ALB ingress, full control plane audit
+  logging, API-mode access entries, and a scan-on-push, immutable ECR repo.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wiz
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  KubernetesVersion:
+    Type: String
+    Default: ""
+    Description: Leave empty to use the EKS default version
+  AdminPrincipalArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional IAM role/user ARN (yours, not an assumed-role session ARN) to get
+      cluster-admin for kubectl during the demo. Must differ from the deploy role.
+  PublicEndpointCidrs:
+    Type: CommaDelimitedList
+    Default: 0.0.0.0/0
+    Description: CIDRs allowed to reach the public API endpoint (GitHub-hosted runners need broad access)
+
+Conditions:
+  HasVersion: !Not [!Equals [!Ref KubernetesVersion, ""]]
+  HasAdmin: !Not [!Equals [!Ref AdminPrincipalArn, ""]]
+
+Resources:
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-eks-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSComputePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSBlockStoragePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSLoadBalancingPolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSNetworkingPolicy"
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          EKS creates the EC2 access entry for this role automatically during
+          cluster creation, so this template must not create one.
+        must:
+          - Cannot change after Auto Mode compute is enabled.
+    Properties:
+      RoleName: !Sub "${ProjectName}-eks-node-role"
+      PermissionsBoundary: !ImportValue
+        Fn::Sub: "${ProjectName}-WorkloadGuardrailBoundaryArn"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Auto Mode removes node group, VPC CNI, and Load Balancer Controller
+          management. Nodes land only in the private subnets listed here; the
+          ALB is placed in subnets tagged kubernetes.io/role/elb.
+        must:
+          - Keep audit logging enabled (enforced by cfn-guard).
+          - SubnetIds must stay private-only (exercise requirement).
+    Properties:
+      Name: !Sub "${ProjectName}-eks"
+      Version: !If [HasVersion, !Ref KubernetesVersion, !Ref AWS::NoValue]
+      RoleArn: !GetAtt ClusterRole.Arn
+      BootstrapSelfManagedAddons: false
+      UpgradePolicy:
+        SupportType: STANDARD
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: true
+      ComputeConfig:
+        Enabled: true
+        NodePools: [general-purpose, system]
+        NodeRoleArn: !GetAtt NodeRole.Arn
+      KubernetesNetworkConfig:
+        ElasticLoadBalancing:
+          Enabled: true
+      StorageConfig:
+        BlockStorage:
+          Enabled: true
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "${ProjectName}-PrivateSubnet1"
+          - !ImportValue
+            Fn::Sub: "${ProjectName}-PrivateSubnet2"
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+        PublicAccessCidrs: !Ref PublicEndpointCidrs
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+
+  AdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasAdmin
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref AdminPrincipalArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: !Sub "arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          AccessScope: { Type: cluster }
+
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Immutable tags (git SHA) make deployments traceable; scan-on-push adds a registry-side check.
+    Properties:
+      RepositoryName: !Sub "${ProjectName}/tasky"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 20 images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},
+            "action":{"type":"expire"}}]}
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${ProjectName}-EksClusterName" }
+  ClusterSecurityGroupId:
+    Value: !GetAtt Cluster.ClusterSecurityGroupId
+  RepositoryUri:
+    Value: !GetAtt AppRepository.RepositoryUri
+    Export: { Name: !Sub "${ProjectName}-EcrRepositoryUri" }
+  UpdateKubeconfigCommand:
+    Value: !Sub "aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}"

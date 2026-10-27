@@ -1,0 +1,20 @@
+# Exercise requirement: expose the app via a Kubernetes Ingress backed by an AWS ALB.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tasky
+  namespace: tasky
+  annotations:
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tasky
+                port: { number: 80 }

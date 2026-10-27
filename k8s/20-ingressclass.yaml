@@ -1,0 +1,19 @@
+# EKS Auto Mode's built-in load balancer controller. ALB settings live in
+# IngressClassParams (Auto Mode does not read annotations on the IngressClass).
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: alb
+spec:
+  scheme: internet-facing
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: alb

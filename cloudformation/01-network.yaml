@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Wiz exercise - network. VPC with two public subnets (MongoDB VM, ALB, NAT)
+  and two private subnets (EKS nodes and pods) across two AZs, plus VPC Flow
+  Logs as a network-level detective control.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wiz
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-igw" }]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------- Public subnets: MongoDB VM, internet-facing ALB, NAT ----------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Public IPs are assigned explicitly (EIP) rather than on launch.
+        must:
+          - Keep kubernetes.io/role/elb tag so EKS Auto Mode can place the ALB here.
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 16, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-1" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 16, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-2" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  # ---------- Private subnets: EKS nodes + pods (VPC CNI gives pods VPC IPs) ----------
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: /20 leaves room for Auto Mode prefix delegation (/28 per node).
+        must:
+          - MongoDB security group trusts these CIDRs; changing them breaks DB access.
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 12]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-private-1" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 12]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-private-2" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+
+  # ---------- Routing ----------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-rt" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-nat-eip" }]
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Single NAT keeps lab cost down; production would use one per AZ.
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-nat" }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-rt" }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
+
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  # ---------- VPC Flow Logs (detective) ----------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/vpc-flow-logs"
+      RetentionInDays: 30
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !GetAtt FlowLogGroup.Arn
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${ProjectName}-VpcId" }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub "${ProjectName}-VpcCidr" }
+  PublicSubnet1:
+    Value: !Ref PublicSubnet1
+    Export: { Name: !Sub "${ProjectName}-PublicSubnet1" }
+  PublicSubnet2:
+    Value: !Ref PublicSubnet2
+    Export: { Name: !Sub "${ProjectName}-PublicSubnet2" }
+  PrivateSubnet1:
+    Value: !Ref PrivateSubnet1
+    Export: { Name: !Sub "${ProjectName}-PrivateSubnet1" }
+  PrivateSubnet2:
+    Value: !Ref PrivateSubnet2
+    Export: { Name: !Sub "${ProjectName}-PrivateSubnet2" }
+  PrivateSubnet1Cidr:
+    Value: !GetAtt PrivateSubnet1.CidrBlock
+    Export: { Name: !Sub "${ProjectName}-PrivateSubnet1Cidr" }
+  PrivateSubnet2Cidr:
+    Value: !GetAtt PrivateSubnet2.CidrBlock
+    Export: { Name: !Sub "${ProjectName}-PrivateSubnet2Cidr" }

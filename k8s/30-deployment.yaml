@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasky
+  namespace: tasky
+  labels: { app: tasky }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: tasky }
+  template:
+    metadata:
+      labels: { app: tasky }
+    spec:
+      serviceAccountName: tasky-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: tasky
+          image: IMAGE_PLACEHOLDER   # replaced by the app pipeline with <ecr-uri>:<git-sha>
+          ports:
+            - { name: http, containerPort: 8080 }
+          # Exercise requirement: MongoDB access is configured through an env var
+          # set by Kubernetes (sourced from a Secret, never baked into the image).
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef: { name: tasky-secrets, key: MONGODB_URI }
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: tasky-secrets, key: SECRET_KEY }
+            - name: GIN_MODE
+              value: release
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }

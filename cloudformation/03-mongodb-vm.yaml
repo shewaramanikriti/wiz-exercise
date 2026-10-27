@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Wiz exercise - database tier. Ubuntu 20.04 (EOL) EC2 VM in a public subnet
+  running outdated MongoDB with auth enabled, reachable on 27017 only from the
+  EKS private subnets. Daily mongodump to a public-read/public-list S3 bucket.
+  Contains INTENTIONAL weaknesses required by the exercise (see Metadata).
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  IntentionalWeaknesses:
+    - "W1: OS is Ubuntu 20.04, standard support ended May 2025; auto-patching disabled"
+    - "W2: SSH (22) open to 0.0.0.0/0 by default"
+    - "W3: Instance role is admin-level, incl. creating VMs (capped by the guardrail boundary)"
+    - "W4: MongoDB 4.4 (EOL Feb 2024) by default"
+    - "W5: Backup bucket allows anonymous read and list"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wiz
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  MongoAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Ubuntu 20.04 (focal) AMI. Override with a literal AMI id if the parameter is gone.
+  MongoVersion:
+    Type: String
+    Default: "4.4"
+    AllowedValues: ["4.4", "5.0", "6.0"]
+    Description: All three are past end-of-life and available for focal
+  InstanceType:
+    Type: String
+    Default: t3.small
+  SshIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: INTENTIONAL - exercise requires SSH exposed to the internet
+  AttachVmGuardrailBoundary:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Preventative control demo. true = admin-level VM role still works (can
+      create VMs, read all S3/secrets) but cannot disable CloudTrail/GuardDuty/
+      Config or create IAM users. false = raw role with no cap at all.
+
+Conditions:
+  UseBoundary: !Equals [!Ref AttachVmGuardrailBoundary, "true"]
+
+Resources:
+  # ---------- Secrets (never in parameters or user data) ----------
+  MongoAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/mongodb/app-user"
+      Description: MongoDB credentials used by the Tasky app and the backup job
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"tasky"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  AppJwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/tasky/jwt-secret-key"
+      Description: SECRET_KEY used by Tasky to sign JWTs
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ---------- W5: public backup bucket ----------
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          INTENTIONAL (W5). The exercise requires public read and public listing.
+          Anyone can enumerate and download full database dumps, including
+          bcrypt password hashes in the user collection.
+        must:
+          - Name must match the CloudTrail data-event selector in the security stack.
+          - Do not add a TLS-only deny; anonymous http and https access must both work.
+          - Account-level S3 Block Public Access must be off or this policy is rejected.
+    Properties:
+      BucketName: !Sub "${ProjectName}-db-backups-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-backups
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: IntentionalPublicList
+            Effect: Allow
+            Principal: "*"
+            Action: s3:ListBucket
+            Resource: !GetAtt BackupBucket.Arn
+          - Sid: IntentionalPublicRead
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${BackupBucket.Arn}/*"
+
+  # ---------- Network access ----------
+  MongoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          27017 is restricted to the EKS private subnets (pods get VPC IPs from
+          these subnets via the VPC CNI). SSH is INTENTIONALLY open (W2).
+        must:
+          - Never open 27017 beyond the Kubernetes subnets.
+    Properties:
+      GroupDescription: MongoDB VM - SSH from internet (intentional), Mongo from EKS subnets only
+      VpcId: !ImportValue
+        Fn::Sub: "${ProjectName}-VpcId"
+      SecurityGroupIngress:
+        - Description: INTENTIONAL W2 - SSH exposed to the internet
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshIngressCidr
+        - Description: MongoDB from EKS private subnet 1
+          IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          CidrIp: !ImportValue
+            Fn::Sub: "${ProjectName}-PrivateSubnet1Cidr"
+        - Description: MongoDB from EKS private subnet 2
+          IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          CidrIp: !ImportValue
+            Fn::Sub: "${ProjectName}-PrivateSubnet2Cidr"
+      SecurityGroupEgress:
+        - Description: Package repos, S3, Secrets Manager
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-mongodb-sg" }]
+
+  # ---------- W3: overly permissive instance role ----------
+  MongoVmPermissivePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          INTENTIONAL (W3). Effectively admin: the VM can launch instances
+          (crypto-mining, pivoting), read every bucket and secret, and call any
+          API. Customer-managed so AWS Config admin/full-access rules flag it.
+          The guardrail permissions boundary is what still stops it from
+          disabling CloudTrail/GuardDuty/Config or escalating through IAM.
+        must:
+          - Only ever attach to roles that carry the guardrail boundary.
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-mongodb-vm-overly-permissive"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: IntentionalAdminLevelAccess
+            Effect: Allow
+            Action: "*"
+            Resource: "*"
+
+  MongoVmRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          The optional guardrail boundary is a preventative control that limits
+          the blast radius of W3 without removing it - the role stays admin-level.
+    Properties:
+      RoleName: !Sub "${ProjectName}-mongodb-vm-role"
+      PermissionsBoundary: !If
+        - UseBoundary
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-WorkloadGuardrailBoundaryArn"
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref MongoVmPermissivePolicy
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  MongoVmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref MongoVmRole]
+
+  MongoKeyPair:
+    Type: AWS::EC2::KeyPair
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Private key is stored in SSM at /ec2/keypair/<KeyPairId> (SecureString).
+    Properties:
+      KeyName: !Sub "${ProjectName}-mongodb-key"
+      KeyType: ed25519
+
+  MongoLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref MongoAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref MongoKeyPair
+        IamInstanceProfile: { Arn: !GetAtt MongoVmInstanceProfile.Arn }
+        SecurityGroupIds: [!Ref MongoSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-mongodb" }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > >(tee -a /var/log/user-data.log) 2>&1
+            export DEBIAN_FRONTEND=noninteractive
+            REGION="${AWS::Region}"
+            BUCKET="${BackupBucket}"
+            SECRET_ARN="${MongoAppSecret}"
+            MONGO_VERSION="${MongoVersion}"
+
+            echo "== W1 (intentional): disable automatic OS patching =="
+            systemctl stop unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
+            systemctl disable unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
+            while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 5; done
+
+            apt-get update -y
+            apt-get install -y gnupg curl jq awscli
+
+            echo "== W4 (intentional): install MongoDB $MONGO_VERSION =="
+            curl -fsSL "https://www.mongodb.org/static/pgp/server-$MONGO_VERSION.asc" \
+              | gpg --dearmor -o "/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg"
+            echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-$MONGO_VERSION.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/$MONGO_VERSION multiverse" \
+              > "/etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list"
+            apt-get update -y
+            apt-get install -y mongodb-org
+            dpkg-query -W -f='${!Package}\n' 'mongodb-org*' | xargs apt-mark hold
+
+            # Auth enabled from first start; the first user is created through the
+            # localhost exception. bindIp 0.0.0.0 is safe only because the security
+            # group limits 27017 to the EKS subnets.
+            cat > /etc/mongod.conf <<'EOF'
+            storage:
+              dbPath: /var/lib/mongodb
+            systemLog:
+              destination: file
+              logAppend: true
+              path: /var/log/mongodb/mongod.log
+            net:
+              port: 27017
+              bindIp: 0.0.0.0
+            processManagement:
+              timeZoneInfo: /usr/share/zoneinfo
+            security:
+              authorization: enabled
+            EOF
+            systemctl enable --now mongod
+
+            MSH=$(command -v mongosh || command -v mongo)
+            for i in $(seq 1 60); do
+              "$MSH" --quiet --eval 'db.runCommand({ping: 1}).ok' && break
+              sleep 2
+            done
+
+            SECRET_JSON=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" --query SecretString --output text)
+            DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
+            DB_PASS=$(echo "$SECRET_JSON" | jq -r .password)
+            "$MSH" admin --quiet --eval "db.createUser({user: '$DB_USER', pwd: '$DB_PASS', roles: [{role: 'readWrite', db: 'go-mongodb'}, {role: 'backup', db: 'admin'}, {role: 'clusterMonitor', db: 'admin'}]})"
+            unset SECRET_JSON DB_PASS
+
+            echo "== Daily backup job to S3 =="
+            cat > /etc/mongo-backup.env <<EOF
+            REGION=$REGION
+            BUCKET=$BUCKET
+            SECRET_ARN=$SECRET_ARN
+            EOF
+            cat > /usr/local/bin/mongo-backup.sh <<'EOF'
+            #!/bin/bash
+            set -euo pipefail
+            source /etc/mongo-backup.env
+            SECRET_JSON=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" --query SecretString --output text)
+            DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
+            DB_PASS=$(echo "$SECRET_JSON" | jq -r .password)
+            STAMP=$(date -u +%Y-%m-%dT%H%M%SZ)
+            ARCHIVE="/tmp/mongodb-$STAMP.archive.gz"
+            mongodump --host 127.0.0.1 --port 27017 --username "$DB_USER" --password "$DB_PASS" \
+              --authenticationDatabase admin --gzip --archive="$ARCHIVE"
+            aws s3 cp "$ARCHIVE" "s3://$BUCKET/backups/mongodb-$STAMP.archive.gz" --region "$REGION"
+            rm -f "$ARCHIVE"
+            echo "$(date -u) backup uploaded: s3://$BUCKET/backups/mongodb-$STAMP.archive.gz"
+            EOF
+            chmod 0750 /usr/local/bin/mongo-backup.sh
+            echo '0 2 * * * root /usr/local/bin/mongo-backup.sh >> /var/log/mongo-backup.log 2>&1' > /etc/cron.d/mongo-backup
+            chmod 0644 /etc/cron.d/mongo-backup
+
+            /usr/local/bin/mongo-backup.sh >> /var/log/mongo-backup.log 2>&1 || true
+            echo "== user-data complete =="
+
+  MongoInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Public subnet per the exercise diagram; reachable via SSH and SSM.
+        mutability:
+          LaunchTemplate: replacement
+    Properties:
+      SubnetId: !ImportValue
+        Fn::Sub: "${ProjectName}-PublicSubnet1"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MongoLaunchTemplate
+        Version: !GetAtt MongoLaunchTemplate.LatestVersionNumber
+
+  MongoEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref MongoInstance
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-mongodb-eip" }]
+
+Outputs:
+  MongoInstanceId:
+    Value: !Ref MongoInstance
+  MongoPrivateIp:
+    Value: !GetAtt MongoInstance.PrivateIp
+    Export: { Name: !Sub "${ProjectName}-MongoPrivateIp" }
+  MongoPublicIp:
+    Value: !Ref MongoEip
+  MongoSecretArn:
+    Value: !Ref MongoAppSecret
+    Export: { Name: !Sub "${ProjectName}-MongoSecretArn" }
+  AppJwtSecretArn:
+    Value: !Ref AppJwtSecret
+    Export: { Name: !Sub "${ProjectName}-AppJwtSecretArn" }
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  BackupBucketPublicListUrl:
+    Value: !Sub "https://${BackupBucket}.s3.${AWS::Region}.amazonaws.com/?list-type=2"
+  KeyPairId:
+    Value: !GetAtt MongoKeyPair.KeyPairId
+  GetSshKeyCommand:
+    Value: !Sub "aws ssm get-parameter --name /ec2/keypair/${MongoKeyPair.KeyPairId} --with-decryption --query Parameter.Value --output text > mongo.pem && chmod 600 mongo.pem"
+  SshCommand:
+    Value: !Sub "ssh -i mongo.pem ubuntu@${MongoEip}"

@@ -1,0 +1,7 @@
+*.pem
+.env
+.env.*
+rendered/
+image.tar.gz
+*.sarif
+.DS_Store

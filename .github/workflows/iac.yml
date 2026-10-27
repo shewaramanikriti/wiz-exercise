@@ -1,0 +1,141 @@
+name: iac
+
+# Pipeline 1: securely deploy the exercise as Infrastructure-as-Code.
+#   PRs  -> lint + policy gate + posture scan only (no cloud credentials at all)
+#   main -> same gates, then deploy in the protected "production" environment
+
+on:
+  pull_request:
+    paths: [cloudformation/**, policies/**, .github/workflows/iac.yml]
+  push:
+    branches: [main]
+    paths: [cloudformation/**, policies/**, .github/workflows/iac.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT: ${{ vars.PROJECT_NAME || 'wiz' }}
+  CFN_GUARD_VERSION: 3.2.1
+
+jobs:
+  scan:
+    name: Lint, policy gate, posture scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: cfn-lint (syntax and schema - hard fail)
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint cloudformation/*.yaml
+
+      - name: cfn-guard (non-negotiable baseline controls - hard fail)
+        run: |
+          curl -sSfL -o guard.tgz \
+            "https://github.com/aws-cloudformation/cloudformation-guard/releases/download/${CFN_GUARD_VERSION}/cfn-guard-v3-x86_64-ubuntu-latest.tar.gz"
+          tar xzf guard.tgz
+          GUARD=$(find . -name cfn-guard -type f | head -1)
+          "$GUARD" validate -d cloudformation/ -r policies/guard/ --show-summary fail
+
+      - name: Checkov (posture findings incl. intentional weaknesses - reported, soft fail)
+        uses: bridgecrewio/checkov-action@c3e106d5f8f4253a6de5110efb41a080f83db294 # v12.3135.0
+        with:
+          directory: cloudformation
+          framework: cloudformation
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: true
+
+      - name: Upload Checkov results to GitHub code scanning
+        if: always()
+        continue-on-error: true   # code scanning needs a public repo or GitHub Advanced Security
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-iac
+
+  deploy:
+    name: Deploy stacks
+    needs: scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production          # required reviewers = human approval gate
+    permissions:
+      contents: read
+      id-token: write                # OIDC -> short-lived AWS credentials
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Network
+        run: |
+          aws cloudformation deploy --no-fail-on-empty-changeset \
+            --stack-name "$PROJECT-network" \
+            --template-file cloudformation/01-network.yaml \
+            --parameter-overrides ProjectName="$PROJECT" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags project="$PROJECT" managed-by=github-actions
+
+      - name: Security baseline (before any workload)
+        run: |
+          aws cloudformation deploy --no-fail-on-empty-changeset \
+            --stack-name "$PROJECT-security" \
+            --template-file cloudformation/02-security-baseline.yaml \
+            --parameter-overrides \
+              ProjectName="$PROJECT" \
+              AlertEmail="${{ vars.ALERT_EMAIL }}" \
+              CreateGuardDutyDetector="${{ vars.CREATE_GUARDDUTY || 'true' }}" \
+              CreateConfigRecorder="${{ vars.CREATE_CONFIG_RECORDER || 'true' }}" \
+              EnableSecurityHub="${{ vars.ENABLE_SECURITY_HUB || 'true' }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags project="$PROJECT" managed-by=github-actions
+
+      - name: MongoDB VM
+        run: |
+          aws cloudformation deploy --no-fail-on-empty-changeset \
+            --stack-name "$PROJECT-mongodb" \
+            --template-file cloudformation/03-mongodb-vm.yaml \
+            --parameter-overrides \
+              ProjectName="$PROJECT" \
+              MongoVersion="${{ vars.MONGO_VERSION || '4.4' }}" \
+              AttachVmGuardrailBoundary="${{ vars.VM_GUARDRAIL_BOUNDARY || 'true' }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags project="$PROJECT" managed-by=github-actions
+
+      - name: EKS + ECR
+        run: |
+          aws cloudformation deploy --no-fail-on-empty-changeset \
+            --stack-name "$PROJECT-eks" \
+            --template-file cloudformation/04-eks.yaml \
+            --parameter-overrides \
+              ProjectName="$PROJECT" \
+              AdminPrincipalArn="${{ vars.EKS_ADMIN_PRINCIPAL_ARN }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags project="$PROJECT" managed-by=github-actions
+
+      - name: Show outputs
+        run: |
+          for s in network security mongodb eks; do
+            echo "::group::$PROJECT-$s"
+            aws cloudformation describe-stacks --stack-name "$PROJECT-$s" \
+              --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output table
+            echo "::endgroup::"
+          done

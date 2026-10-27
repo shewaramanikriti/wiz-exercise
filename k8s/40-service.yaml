@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasky
+  namespace: tasky
+spec:
+  # NodePort works for both ALB target types (ip and instance).
+  type: NodePort
+  selector: { app: tasky }
+  ports:
+    - { name: http, port: 80, targetPort: http }

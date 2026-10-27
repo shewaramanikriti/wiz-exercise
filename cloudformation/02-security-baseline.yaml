@@ -1,0 +1,566 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Wiz exercise - cloud native security baseline, deployed BEFORE the workload.
+  Audit: multi-region CloudTrail (log validation, CloudWatch Logs, S3 data
+  events on the DB backup bucket). Detective: GuardDuty, AWS Config managed
+  rules, Security Hub, EventBridge-to-SNS alerting. Preventative: a permissions
+  boundary that stops workload roles from disabling audit and detection.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wiz
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for security alerts (confirm the SNS subscription)
+  CreateGuardDutyDetector:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: false if a detector already exists in this region (only one allowed)
+  CreateConfigRecorder:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: false if an AWS Config recorder already exists in this region
+  EnableSecurityHub:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: false if Security Hub is already enabled in this region
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  MakeGuardDuty: !Equals [!Ref CreateGuardDutyDetector, "true"]
+  MakeConfig: !Equals [!Ref CreateConfigRecorder, "true"]
+  MakeSecurityHub: !Equals [!Ref EnableSecurityHub, "true"]
+
+Resources:
+  # =====================================================================
+  # AUDIT: CloudTrail (control plane audit logging)
+  # =====================================================================
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Audit evidence must outlive the lab stacks.
+        must:
+          - Never make this bucket public; never remove Retain.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-logs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt TrailBucket.Arn, !Sub "${TrailBucket.Arn}/*"]
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  TrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/cloudtrail"
+      RetentionInDays: 365
+
+  TrailToLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: cloudtrail-to-cwlogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${TrailLogGroup.Arn}"
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Management events give control-plane audit; S3 data events on the
+          public backup bucket record every anonymous GetObject/ListBucket.
+        must:
+          - Keep log file validation and multi-region enabled (enforced by cfn-guard).
+    Properties:
+      TrailName: !Sub "${ProjectName}-trail"
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt TrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt TrailToLogsRole.Arn
+      AdvancedEventSelectors:
+        - Name: All management events
+          FieldSelectors:
+            - { Field: eventCategory, Equals: [Management] }
+        - Name: Object access on the public DB backup bucket
+          FieldSelectors:
+            - { Field: eventCategory, Equals: [Data] }
+            - { Field: resources.type, Equals: ["AWS::S3::Object"] }
+            - Field: resources.ARN
+              StartsWith:
+                - !Sub "arn:${AWS::Partition}:s3:::${ProjectName}-db-backups-${AWS::AccountId}-${AWS::Region}/"
+
+  # =====================================================================
+  # DETECTIVE: GuardDuty
+  # =====================================================================
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Condition: MakeGuardDuty
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Threat detection across CloudTrail, VPC flow, DNS, EKS audit logs and
+          runtime (EC2 agent covers the MongoDB VM; EKS add-on covers pods).
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Features:
+        - { Name: S3_DATA_EVENTS, Status: ENABLED }
+        - { Name: EKS_AUDIT_LOGS, Status: ENABLED }
+        - { Name: EBS_MALWARE_PROTECTION, Status: ENABLED }
+        - Name: RUNTIME_MONITORING
+          Status: ENABLED
+          AdditionalConfiguration:
+            - { Name: EKS_ADDON_MANAGEMENT, Status: ENABLED }
+            - { Name: EC2_AGENT_MANAGEMENT, Status: ENABLED }
+
+  # =====================================================================
+  # DETECTIVE: AWS Config + managed rules
+  # =====================================================================
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: MakeConfig
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: MakeConfig
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: [s3:GetBucketAcl, s3:ListBucket]
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt ConfigBucket.Arn, !Sub "${ConfigBucket.Arn}/*"]
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Condition: MakeConfig
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWS_ConfigRole"
+      Policies:
+        - PolicyName: deliver-to-config-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub "${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [s3:GetBucketAcl]
+                Resource: !GetAtt ConfigBucket.Arn
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: MakeConfig
+    Properties:
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: MakeConfig
+    DependsOn: ConfigBucketPolicy
+    Properties:
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # Rules need a running recorder. This handle depends on the recorder only
+  # when this stack creates it (conditional-dependency pattern).
+  ConfigReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      RecorderDependency: !If [MakeConfig, !Ref ConfigRecorder, ""]
+      ChannelDependency: !If [MakeConfig, !Ref ConfigDeliveryChannel, ""]
+
+  RuleS3PublicRead:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-s3-bucket-public-read-prohibited"
+      Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED }
+      Scope: { ComplianceResourceTypes: ["AWS::S3::Bucket"] }
+
+  RuleS3BucketLevelPab:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-s3-bucket-level-public-access-prohibited"
+      Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED }
+      Scope: { ComplianceResourceTypes: ["AWS::S3::Bucket"] }
+
+  RuleRestrictedSsh:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-restricted-ssh"
+      Source: { Owner: AWS, SourceIdentifier: INCOMING_SSH_DISABLED }
+      Scope: { ComplianceResourceTypes: ["AWS::EC2::SecurityGroup"] }
+
+  RuleIamFullAccess:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-iam-policy-no-full-service-access"
+      Source: { Owner: AWS, SourceIdentifier: IAM_POLICY_NO_STATEMENTS_WITH_FULL_ACCESS }
+      Scope: { ComplianceResourceTypes: ["AWS::IAM::Policy"] }
+
+  RuleIamAdminAccess:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-iam-policy-no-admin-access"
+      Source: { Owner: AWS, SourceIdentifier: IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS }
+      Scope: { ComplianceResourceTypes: ["AWS::IAM::Policy"] }
+
+  RuleEc2PublicIp:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-ec2-instance-no-public-ip"
+      Source: { Owner: AWS, SourceIdentifier: EC2_INSTANCE_NO_PUBLIC_IP }
+      Scope: { ComplianceResourceTypes: ["AWS::EC2::Instance"] }
+
+  RuleImdsV2:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-ec2-imdsv2-check"
+      Source: { Owner: AWS, SourceIdentifier: EC2_IMDSV2_CHECK }
+      Scope: { ComplianceResourceTypes: ["AWS::EC2::Instance"] }
+
+  RuleEksPublicEndpoint:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-eks-endpoint-no-public-access"
+      Source: { Owner: AWS, SourceIdentifier: EKS_ENDPOINT_NO_PUBLIC_ACCESS }
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  RuleCloudTrailEnabled:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigReady
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-multi-region-cloudtrail-enabled"
+      Source: { Owner: AWS, SourceIdentifier: MULTI_REGION_CLOUD_TRAIL_ENABLED }
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  # =====================================================================
+  # DETECTIVE: Security Hub (aggregates GuardDuty, Config, Inspector)
+  # =====================================================================
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: MakeSecurityHub
+    DependsOn: ConfigReady
+    Properties:
+      EnableDefaultStandards: true
+      ControlFindingGenerator: SECURITY_CONTROL
+      AutoEnableControls: true
+
+  # =====================================================================
+  # ALERTING: EventBridge -> SNS
+  # =====================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Not KMS-encrypted on purpose: EventBridge cannot publish to topics
+          using the AWS-managed SNS key. Production would use a CMK.
+    Properties:
+      TopicName: !Sub "${ProjectName}-security-alerts"
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  GuardDutyFindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: GuardDuty findings of medium severity or higher
+      EventPattern:
+        source: [aws.guardduty]
+        detail-type: [GuardDuty Finding]
+        detail:
+          severity: [{ numeric: [">=", 4] }]
+      Targets: [{ Id: sns, Arn: !Ref AlertTopic }]
+
+  ConfigNonCompliantRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: AWS Config rule evaluations that turn NON_COMPLIANT
+      EventPattern:
+        source: [aws.config]
+        detail-type: [Config Rules Compliance Change]
+        detail:
+          newEvaluationResult:
+            complianceType: [NON_COMPLIANT]
+      Targets: [{ Id: sns, Arn: !Ref AlertTopic }]
+
+  TamperingApiRule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Fires on attempts (successful or denied) to blind the defenders or
+          open the perimeter. IAM events are only emitted in us-east-1.
+    Properties:
+      Description: Defense-evasion and perimeter-change API calls
+      EventPattern:
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventName:
+            - StopLogging
+            - DeleteTrail
+            - UpdateTrail
+            - PutEventSelectors
+            - DeleteDetector
+            - UpdateDetector
+            - StopConfigurationRecorder
+            - DeleteConfigurationRecorder
+            - DeleteDeliveryChannel
+            - DisableSecurityHub
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - PutBucketPublicAccessBlock
+            - DeletePublicAccessBlock
+            - AuthorizeSecurityGroupIngress
+            - CreateAccessKey
+            - AttachRolePolicy
+            - PutRolePolicy
+            - DeleteRolePermissionsBoundary
+      Targets: [{ Id: sns, Arn: !Ref AlertTopic }]
+
+  # =====================================================================
+  # PREVENTATIVE: workload guardrail permissions boundary
+  # =====================================================================
+  WorkloadGuardrailBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_107
+            comment: Permissions boundary - Allow * never grants, it only caps identity policies
+          - id: CKV_AWS_108
+            comment: Permissions boundary - Allow * never grants, it only caps identity policies
+          - id: CKV_AWS_109
+            comment: Permissions boundary - Allow * never grants, it only caps identity policies
+          - id: CKV_AWS_110
+            comment: Permissions boundary - Allow * never grants, it only caps identity policies
+          - id: CKV_AWS_111
+            comment: Permissions boundary - Allow * never grants, it only caps identity policies
+      com.aws.cloudformation.Context:
+        why: >-
+          The MongoDB VM role is intentionally over-privileged. This boundary
+          caps it: whatever the identity policy grants, these actions are
+          always denied, so a compromised VM cannot disable audit/detection,
+          mint long-lived credentials, or escalate through IAM.
+        must:
+          - Every workload role must reference this boundary.
+          - Keep the Allow-all statement; boundaries intersect with identity policies.
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-workload-guardrail-boundary"
+      Description: Permissions boundary for workload roles (preventative control)
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowWithinIdentityPolicy
+            Effect: Allow
+            Action: "*"
+            Resource: "*"
+          - Sid: DenyDefenseEvasion
+            Effect: Deny
+            Action:
+              - cloudtrail:StopLogging
+              - cloudtrail:DeleteTrail
+              - cloudtrail:UpdateTrail
+              - cloudtrail:PutEventSelectors
+              - guardduty:DeleteDetector
+              - guardduty:UpdateDetector
+              - guardduty:DisassociateFromMasterAccount
+              - guardduty:CreateFilter
+              - guardduty:UpdateFilter
+              - config:StopConfigurationRecorder
+              - config:DeleteConfigurationRecorder
+              - config:DeleteDeliveryChannel
+              - config:DeleteConfigRule
+              - securityhub:DisableSecurityHub
+              - securityhub:BatchUpdateFindings
+              - logs:DeleteLogGroup
+              - logs:DeleteLogStream
+              - ec2:DeleteFlowLogs
+            Resource: "*"
+          - Sid: DenyIamEscalationAndPersistence
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:CreateAccessKey
+              - iam:CreateLoginProfile
+              - iam:UpdateLoginProfile
+              - iam:AttachRolePolicy
+              - iam:PutRolePolicy
+              - iam:AttachUserPolicy
+              - iam:PutUserPolicy
+              - iam:CreatePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:UpdateAssumeRolePolicy
+              - iam:DeleteRolePermissionsBoundary
+              - iam:PutRolePermissionsBoundary
+            Resource: "*"
+          - Sid: DenyTouchingAuditBuckets
+            Effect: Deny
+            Action: [s3:DeleteObject, s3:DeleteObjectVersion, s3:PutBucketPolicy, s3:DeleteBucket, s3:PutLifecycleConfiguration]
+            Resource:
+              - !GetAtt TrailBucket.Arn
+              - !Sub "${TrailBucket.Arn}/*"
+
+Outputs:
+  WorkloadGuardrailBoundaryArn:
+    Value: !Ref WorkloadGuardrailBoundary
+    Export: { Name: !Sub "${ProjectName}-WorkloadGuardrailBoundaryArn" }
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub "${ProjectName}-AlertTopicArn" }
+  TrailName:
+    Value: !Ref Trail
+  TrailBucketName:
+    Value: !Ref TrailBucket
+  TrailLogGroupName:
+    Value: !Ref TrailLogGroup

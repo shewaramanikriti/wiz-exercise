@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Wiz exercise - bootstrap. GitHub Actions OIDC identity provider and the
+  deploy role assumed by the IaC and app pipelines. Deploy once, manually,
+  before any pipeline runs. No long-lived AWS keys are stored in GitHub.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    why: Short-lived OIDC credentials replace static access keys in CI.
+    must:
+      - Trust policy must stay pinned to one repo and one GitHub environment.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: wiz
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  GitHubOrg:
+    Type: String
+    Description: GitHub user or organisation that owns the repository
+  GitHubRepo:
+    Type: String
+    Description: Repository name (without the org)
+  GitHubEnvironment:
+    Type: String
+    Default: production
+    Description: GitHub environment the deploy jobs run in (enables required reviewers)
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set false if token.actions.githubusercontent.com already exists in the account
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Pipelines create VPCs, IAM roles, EKS and security services, so the
+          lab uses AdministratorAccess. Blast radius is limited by the trust
+          policy (one repo, one protected environment) rather than by permissions.
+        must:
+          - Never widen the sub condition to a wildcard repo or branch.
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-deploy"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              # !Ref on the provider returns its ARN and creates an implicit dependency
+              Federated: !If
+                - MakeProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironment}"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
+
+Outputs:
+  DeployRoleArn:
+    Description: Store as GitHub secret AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-GitHubDeployRoleArn"

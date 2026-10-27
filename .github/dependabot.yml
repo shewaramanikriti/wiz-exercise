@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions   # keeps the SHA-pinned actions current
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: /app
+    schedule: { interval: weekly }
+  - package-ecosystem: gomod
+    directory: /app/src
+    schedule: { interval: weekly }

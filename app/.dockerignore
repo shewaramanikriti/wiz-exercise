@@ -1,0 +1,7 @@
+# Tasky calls godotenv.Overload(): a stray .env would silently override the
+# Kubernetes-provided MONGODB_URI/SECRET_KEY, so never ship one.
+**/.env
+**/.env.*
+src/.git
+src/.github
+**/*.md

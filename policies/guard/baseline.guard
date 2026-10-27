@@ -1,0 +1,70 @@
+#
+# Non-negotiable controls. The IaC pipeline FAILS if any template violates these.
+# The exercise's intentional weaknesses are deliberately NOT covered here; those
+# are surfaced (soft-fail) by Checkov so they stay visible in GitHub code scanning.
+#
+
+# ---- Audit logging must stay on and tamper-evident ----
+let trails = Resources.*[ Type == 'AWS::CloudTrail::Trail' ]
+rule cloudtrail_hardened when %trails !empty {
+    %trails.Properties.IsLogging == true
+    %trails.Properties.IsMultiRegionTrail == true
+    %trails.Properties.EnableLogFileValidation == true
+    %trails.Properties.CloudWatchLogsLogGroupArn exists
+        <<CloudTrail must be logging, multi-region, validated and streamed to CloudWatch Logs>>
+}
+
+# ---- EKS control plane audit logs must be enabled ----
+let clusters = Resources.*[ Type == 'AWS::EKS::Cluster' ]
+rule eks_audit_logging when %clusters !empty {
+    some %clusters.Properties.Logging.ClusterLogging.EnabledTypes[*].Type == 'audit'
+        <<EKS clusters must ship the audit log type>>
+}
+
+# ---- EKS access must use access entries (no aws-auth ConfigMap drift) ----
+rule eks_api_auth_mode when %clusters !empty {
+    %clusters.Properties.AccessConfig.AuthenticationMode == 'API'
+        <<EKS clusters must use API authentication mode>>
+}
+
+# ---- Container registry hygiene ----
+let repos = Resources.*[ Type == 'AWS::ECR::Repository' ]
+rule ecr_scan_and_immutable when %repos !empty {
+    %repos.Properties.ImageScanningConfiguration.ScanOnPush == true
+    %repos.Properties.ImageTagMutability == 'IMMUTABLE'
+        <<ECR repos must scan on push and use immutable tags>>
+}
+
+# ---- Instances: IMDSv2 and encrypted root volumes ----
+let launch_templates = Resources.*[ Type == 'AWS::EC2::LaunchTemplate' ]
+rule launch_template_imdsv2 when %launch_templates !empty {
+    %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+        <<Launch templates must require IMDSv2>>
+}
+rule launch_template_ebs_encrypted when %launch_templates !empty {
+    %launch_templates.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+        <<All EBS volumes must be encrypted>>
+}
+
+# ---- Every bucket encrypted; no ACL-based public access ----
+let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+rule s3_encrypted when %buckets !empty {
+    %buckets.Properties.BucketEncryption exists
+        <<S3 buckets must have default encryption>>
+}
+rule s3_no_public_acls when %buckets !empty {
+    %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+    %buckets.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+    %buckets.Properties.OwnershipControls.Rules[*].ObjectOwnership == 'BucketOwnerEnforced'
+        <<Buckets must disable ACLs; any public access must be explicit in a bucket policy>>
+}
+
+# ---- Workload roles must carry the guardrail permissions boundary ----
+let ec2_roles = Resources.*[
+    Type == 'AWS::IAM::Role'
+    some Properties.AssumeRolePolicyDocument.Statement[*].Principal.Service == 'ec2.amazonaws.com'
+]
+rule workload_roles_have_boundary when %ec2_roles !empty {
+    %ec2_roles.Properties.PermissionsBoundary exists
+        <<EC2 workload roles must reference the guardrail permissions boundary>>
+}

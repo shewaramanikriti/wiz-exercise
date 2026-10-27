@@ -272,7 +272,12 @@ Resources:
               > "/etc/apt/sources.list.d/mongodb-org-$MONGO_VERSION.list"
             $APT update
             $APT install mongodb-org
-            dpkg-query -W -f='${!Package}\n' 'mongodb-org*' | xargs apt-mark hold
+            # Hold the installed MongoDB packages so nothing upgrades them. An explicit
+            # list: a 'mongodb-org*' glob also matches repo-only (uninstalled) packages.
+            for p in mongodb-org mongodb-org-server mongodb-org-shell mongodb-org-mongos mongodb-org-tools mongodb-org-database-tools-extra mongodb-mongosh; do
+              apt-mark hold "$p" >/dev/null 2>&1 || true
+            done
+            apt-mark showhold
 
             # Auth enabled from first start; the first user is created through the
             # localhost exception. bindIp 0.0.0.0 is safe only because the security

@@ -279,10 +279,20 @@ Resources:
             done
             apt-mark showhold
 
-            # Auth enabled from first start; the first user is created through the
-            # localhost exception. bindIp 0.0.0.0 is safe only because the security
-            # group limits 27017 to the EKS subnets.
-            cat > /etc/mongod.conf <<'EOF'
+            # Bootstrap the first user with auth OFF and mongod bound to localhost,
+            # then enable auth and listen on all interfaces. Deterministic: does not
+            # depend on MongoDB's localhost exception. bindIp 0.0.0.0 is safe only
+            # because the security group limits 27017 to the EKS subnets.
+            MSH=$(command -v mongosh || command -v mongo)
+            wait_mongo() {
+              for i in $(seq 1 90); do
+                "$MSH" --quiet --eval 'db.runCommand({ping: 1}).ok' >/dev/null 2>&1 && return 0
+                sleep 2
+              done
+              echo "mongod did not become ready"; return 1
+            }
+            write_conf() {
+              cat > /etc/mongod.conf <<EOF
             storage:
               dbPath: /var/lib/mongodb
             systemLog:
@@ -291,25 +301,28 @@ Resources:
               path: /var/log/mongodb/mongod.log
             net:
               port: 27017
-              bindIp: 0.0.0.0
+              bindIp: $1
             processManagement:
               timeZoneInfo: /usr/share/zoneinfo
-            security:
-              authorization: enabled
             EOF
-            systemctl enable --now mongod
+              if [ "$2" = "auth" ]; then printf 'security:\n  authorization: enabled\n' >> /etc/mongod.conf; fi
+            }
 
-            MSH=$(command -v mongosh || command -v mongo)
-            for i in $(seq 1 60); do
-              "$MSH" --quiet --eval 'db.runCommand({ping: 1}).ok' && break
-              sleep 2
-            done
+            write_conf 127.0.0.1 noauth
+            systemctl enable mongod
+            systemctl restart mongod
+            wait_mongo
 
             SECRET_JSON=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" --query SecretString --output text)
             DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
             DB_PASS=$(echo "$SECRET_JSON" | jq -r .password)
-            "$MSH" admin --quiet --eval "db.createUser({user: '$DB_USER', pwd: '$DB_PASS', roles: [{role: 'readWrite', db: 'go-mongodb'}, {role: 'backup', db: 'admin'}, {role: 'clusterMonitor', db: 'admin'}]})"
+            "$MSH" admin --quiet --eval "if (db.getUser('$DB_USER') == null) { db.createUser({user: '$DB_USER', pwd: '$DB_PASS', roles: [{role: 'readWrite', db: 'go-mongodb'}, {role: 'backup', db: 'admin'}, {role: 'clusterMonitor', db: 'admin'}]}); print('user created') } else { print('user exists') }"
             unset SECRET_JSON DB_PASS
+
+            write_conf 0.0.0.0 auth
+            systemctl restart mongod
+            wait_mongo
+            echo "== MongoDB ready: authorization enabled, listening on 0.0.0.0 =="
 
             echo "== Daily backup job to S3 =="
             cat > /etc/mongo-backup.env <<EOF

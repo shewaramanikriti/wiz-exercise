@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"time"
@@ -19,16 +18,17 @@ func CreateMongoClient() *mongo.Client {
 	MongoDbURI := os.Getenv("MONGODB_URI")
 	client, err := mongo.NewClient(options.Client().ApplyURI(MongoDbURI))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Invalid MongoDB connection configuration")
 	}
 
 	var ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 	err = client.Connect(ctx)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("MongoDB client initialization failed")
 	}
 	defer cancel()
-	fmt.Println("Connected to MONGO -> ", MongoDbURI)
+	// Connect is lazy. Do not claim a successful database query or log the URI.
+	log.Println("MongoDB client configured")
 	return client
 }
 

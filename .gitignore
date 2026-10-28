@@ -5,3 +5,6 @@ rendered/
 image.tar.gz
 *.sarif
 .DS_Store
+
+__pycache__/
+*.py[cod]

@@ -120,6 +120,17 @@ Resources:
             Principal: "*"
             Action: s3:GetObject
             Resource: !Sub "${BackupBucket.Arn}/*"
+          # Public means anonymous, not unencrypted. Both required public
+          # operations remain available through the S3 HTTPS endpoint.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt BackupBucket.Arn, !Sub "${BackupBucket.Arn}/*"]
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+                aws:PrincipalIsAWSService: "false"
 
   # ---------- Network access ----------
   MongoSecurityGroup:

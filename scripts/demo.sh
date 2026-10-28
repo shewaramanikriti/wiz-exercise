@@ -2,6 +2,9 @@
 # Live-walkthrough helper: proves each exercise requirement with real output.
 # Usage: PROJECT=wiz AWS_REGION=us-east-1 ./scripts/demo.sh
 set -u   # demo script: keep going when a step reports a refusal via a non-zero exit
+umask 077
+DEMO_TMP=$(mktemp -d) || exit 2
+trap 'rm -rf -- "$DEMO_TMP"' EXIT
 PROJECT="${PROJECT:-wiz}"; export AWS_REGION="${AWS_REGION:-us-east-1}"
 NC="nc -z -w 3"; nc -h 2>&1 | grep -q -- "-G" && NC="nc -z -G 3 -w 3"   # macOS nc ignores -w while connecting; -G is its connect timeout
 out() { aws cloudformation describe-stacks --stack-name "$PROJECT-$1" \
@@ -30,8 +33,8 @@ echo "http://$HOST"; curl -s -o /dev/null -w "HTTP %{http_code}\n" "http://$HOST
 
 step "5. Prove the data is in MongoDB (query from the VM)"
 aws ssm get-parameter --name "/ec2/keypair/$KEY_ID" --with-decryption \
-  --query Parameter.Value --output text > /tmp/mongo.pem && chmod 600 /tmp/mongo.pem
-ssh -o StrictHostKeyChecking=accept-new -i /tmp/mongo.pem "ubuntu@$MONGO_PUB" '
+  --query Parameter.Value --output text > "$DEMO_TMP/mongo.pem" || exit 2
+ssh -o StrictHostKeyChecking=accept-new -i "$DEMO_TMP/mongo.pem" "ubuntu@$MONGO_PUB" '
   S=$(aws secretsmanager get-secret-value --region '"$AWS_REGION"' --secret-id '"$PROJECT"'/mongodb/app-user --query SecretString --output text)
   U=$(echo "$S" | jq -r .username); P=$(echo "$S" | jq -r .password)
   M=$(command -v mongosh || command -v mongo)
@@ -39,14 +42,14 @@ ssh -o StrictHostKeyChecking=accept-new -i /tmp/mongo.pem "ubuntu@$MONGO_PUB" '
      --eval "print(\"mongo \" + db.version()); printjson(db.getCollectionNames()); print(\"users: \" + db.user.countDocuments({})); db.todos.find().limit(5).forEach(printjson)"'
 
 step "6. Outdated OS and MongoDB versions"
-ssh -i /tmp/mongo.pem "ubuntu@$MONGO_PUB" 'lsb_release -ds; mongod --version | head -1'
+ssh -i "$DEMO_TMP/mongo.pem" "ubuntu@$MONGO_PUB" 'lsb_release -ds; mongod --version | head -1'
 
 step "7. Daily backup job and the objects in S3"
-ssh -i /tmp/mongo.pem "ubuntu@$MONGO_PUB" 'cat /etc/cron.d/mongo-backup; tail -3 /var/log/mongo-backup.log'
+ssh -i "$DEMO_TMP/mongo.pem" "ubuntu@$MONGO_PUB" 'cat /etc/cron.d/mongo-backup; tail -3 /var/log/mongo-backup.log'
 aws s3 ls "s3://$BUCKET/backups/" --human-readable
 
 step "8. Mongo port is NOT reachable from the internet (only SSH is)"
-$NC "$MONGO_PUB" 27017 && echo "27017 OPEN (unexpected)" || echo "27017 closed from internet - restricted to EKS subnets"
+$NC "$MONGO_PUB" 27017 && echo "27017 OPEN (unexpected)" || echo "Probe did not connect; use verify-weaknesses.sh to check the actual SG rules"
 $NC "$MONGO_PUB" 22 && echo "22 open from internet (intentional weakness)"
 
 step "9. Audit logging is on (CloudTrail + EKS control plane)"

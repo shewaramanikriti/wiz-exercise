@@ -1,5 +1,7 @@
 # Wiz Technical Exercise v4 — AWS CloudFormation implementation
 
+> Review update: see [the evidence review and rehearsal guide](docs/2026-10-28-review.md) before using the demo scripts. It distinguishes deployed evidence, proposed fixes and remaining limitations.
+
 A two-tier app (Tasky on EKS → MongoDB on EC2) with the exercise's intentional weaknesses, built entirely with CloudFormation and deployed by GitHub Actions, with a cloud-native security baseline in front of it.
 
 ```mermaid
@@ -30,9 +32,9 @@ Run `./scripts/verify-weaknesses.sh` after deploying. It is read-only and proves
 |---|---|---|
 | Outdated Linux | Ubuntu 20.04, auto-patching **disabled** | No |
 | SSH open to internet | SG 22 from `0.0.0.0/0`, public EIP | No |
-| Overly permissive VM role | `Action: "*"` on `Resource: "*"` — can create VMs, read all S3/secrets | Optional guardrail boundary (`VM_GUARDRAIL_BOUNDARY`, default `true`) denies only disabling logging/detection and creating IAM users. Role is still admin-level and can still create VMs. Set `false` for a completely uncapped role. |
+| Overly permissive VM role | `Action: "*"` on `Resource: "*"` — can create VMs, read all S3/secrets | Optional boundary (`VM_GUARDRAIL_BOUNDARY`, default `true`) denies the specific actions listed in stack 02. It does not cover every way to disrupt logging, alerts or IAM. Role is still admin-level and can still create VMs. Set `false` for a completely uncapped role. |
 | Outdated MongoDB | 4.4 (EOL), apt-held at that version | No |
-| Public read + public list backups | Anonymous `ListBucket` + `GetObject`, over http and https | Encryption at rest (SSE-S3) is transparent to anonymous readers |
+| Public read + public list backups | Anonymous `ListBucket` + `GetObject` over HTTPS | SSE-S3 and HTTPS do not require a reader identity; the public-read/list weakness remains |
 | App SA = cluster-admin | `ClusterRoleBinding` to `cluster-admin`, token automounted | Pod hardening (non-root, PSA `restricted` on the `tasky` namespace) doesn't reduce the SA's rights; cluster-admin can create pods in any other namespace |
 
 These are **requirements**, not weaknesses, and are implemented as the exercise states: MongoDB reachable only from the Kubernetes subnets with auth on; cluster in private subnets; Mongo URI via Kubernetes env var.
@@ -175,7 +177,7 @@ aws cloudformation describe-stacks --stack-name wiz-github-oidc \
 **4.3 Protect `main`.** Go to Settings → Rules → New branch ruleset, target `main`, and enable:
 - block force pushes
 - require a pull request
-- require status checks `scan` and `build-scan` (these appear after the first run, so add them then)
+- require status checks `Lint, policy gate, posture scan` and `Build, verify, scan` (these appear after the first run, so add them then)
 
 **4.4 Turn on code security.** Go to Settings → Code security and enable:
 - secret scanning with push protection
@@ -258,15 +260,15 @@ aws ssm send-command --instance-ids $(aws cloudformation describe-stacks --stack
 
 | # | Weakness | Realistic consequence | Prevented / detected by |
 |---|---|---|---|
-| W1 | EOL Ubuntu 20.04, patching off | Unpatched kernel/OpenSSH CVEs → RCE | Inspector/Security Hub, GuardDuty Runtime |
+| W1 | Ubuntu 20.04 outside standard support, patching off | Unpatched kernel/OpenSSH CVEs → RCE | Version inventory; add Inspector for vulnerability assessment. Verify GuardDuty runtime coverage separately |
 | W2 | SSH open to `0.0.0.0/0` | Brute force, exploit of outdated sshd | Config `INCOMING_SSH_DISABLED`, GuardDuty `SSHBruteForce` |
-| W3 | Admin-level VM role | VM compromise = account compromise: launch miners, read all data | Optional boundary limits blast radius (can't disable CloudTrail/GuardDuty/Config or plant IAM users); Config admin-access rules; EventBridge tampering alerts |
-| W4 | MongoDB 4.4 (EOL) | Unpatched DB CVEs | Inventory via SSM/Inspector |
-| W5 | Public read+list backups | Anyone downloads the full DB incl. password hashes | Config S3 public-read rule, Security Hub, CloudTrail S3 data events record each anonymous read |
-| K1 | App SA bound to `cluster-admin` | App RCE → read every Secret, run anything in the cluster | EKS audit logs, GuardDuty EKS protection; Pod Security still blocks privileged pods |
-| K2 | Tasky logs its full `MONGODB_URI` | DB password in plaintext container logs | Found during review — talk about it as a finding |
+| W3 | Admin-level VM role | VM compromise = account compromise: launch miners, read all data | Optional boundary denies named calls such as StopLogging; other disruption paths remain; Config admin-access rules; EventBridge tampering alerts |
+| W4 | MongoDB 4.4 (EOL) | Unpatched DB CVEs | Version inventory via SSM; Inspector is not provisioned here |
+| W5 | Public read+list backups | Anyone downloads the full DB incl. password hashes | Config S3 public-read rule, Security Hub, CloudTrail data selectors are configured; verify the delivered event for the demonstrated request |
+| K1 | App SA bound to `cluster-admin` | App RCE → read every Secret, run anything in the cluster | EKS audit logs; GuardDuty may produce findings. Namespace Pod Security blocks nonconforming pod specs but cluster-admin can change namespace labels |
+| K2 | Tasky logs its full `MONGODB_URI` | DB password in plaintext container logs | Patched to omit the URI; existing logs and old pods still require handling |
 
-Worth stating in the presentation: the chain W2→W1→W3 is the critical path (internet → shell → admin cloud identity), and the boundary is what turns "full account takeover" into "loud, logged, partial compromise". A scanner flags each item separately; context (exposure + identity + data) is what makes it a critical *path*.
+Worth stating in the presentation: the chain W2→W1→W3 is the critical path (internet → shell → admin cloud identity), and the boundary demonstrates selected explicit denies. It does not establish containment of an administrator-level compromise. A scanner flags each item separately; context (exposure + identity + data) is what makes it a critical *path*.
 
 ## Suggested 45-minute flow
 

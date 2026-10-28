@@ -138,7 +138,8 @@ Resources:
       com.aws.cloudformation.Context:
         why: >-
           Management events give control-plane audit; S3 data events on the
-          public backup bucket record every anonymous GetObject/ListBucket.
+          public backup bucket capture matching data events. Demonstrate a
+          delivered event for each claimed operation; event history omits data events.
         must:
           - Keep log file validation and multi-region enabled (enforced by cfn-guard).
     Properties:
@@ -489,9 +490,10 @@ Resources:
       com.aws.cloudformation.Context:
         why: >-
           The MongoDB VM role is intentionally over-privileged. This boundary
-          caps it: whatever the identity policy grants, these actions are
-          always denied, so a compromised VM cannot disable audit/detection,
-          mint long-lived credentials, or escalate through IAM.
+          caps it: the enumerated actions are explicitly denied for this role.
+          This is a targeted control, not comprehensive containment. Other
+          actions, including changing EKS logging or disabling alert rules,
+          are not denied by this boundary. Demonstrate the specific denies.
         must:
           - Every workload role must reference this boundary.
           - Keep the Allow-all statement; boundaries intersect with identity policies.

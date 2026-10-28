@@ -2,7 +2,7 @@
 # Simulated attack path against YOUR OWN exercise environment, to show each
 # weakness, its consequence, and which control prevented or detected it.
 # Only run against the lab account you deployed.
-set -euo pipefail
+set -u   # demo script: keep going when a step reports a refusal via a non-zero exit
 PROJECT="${PROJECT:-wiz}"; export AWS_REGION="${AWS_REGION:-us-east-1}"
 out() { aws cloudformation describe-stacks --stack-name "$PROJECT-$1" \
           --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text; }

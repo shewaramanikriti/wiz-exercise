@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Live-walkthrough helper: proves each exercise requirement with real output.
 # Usage: PROJECT=wiz AWS_REGION=us-east-1 ./scripts/demo.sh
-set -euo pipefail
+set -u   # demo script: keep going when a step reports a refusal via a non-zero exit
 PROJECT="${PROJECT:-wiz}"; export AWS_REGION="${AWS_REGION:-us-east-1}"
+NC="nc -z -w 3"; nc -h 2>&1 | grep -q -- "-G" && NC="nc -z -G 3 -w 3"   # macOS nc ignores -w while connecting; -G is its connect timeout
 out() { aws cloudformation describe-stacks --stack-name "$PROJECT-$1" \
           --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text; }
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; read -rp "(enter) " _; }
@@ -45,8 +46,8 @@ ssh -i /tmp/mongo.pem "ubuntu@$MONGO_PUB" 'cat /etc/cron.d/mongo-backup; tail -3
 aws s3 ls "s3://$BUCKET/backups/" --human-readable
 
 step "8. Mongo port is NOT reachable from the internet (only SSH is)"
-nc -z -w 3 "$MONGO_PUB" 27017 && echo "27017 OPEN (unexpected)" || echo "27017 closed from internet - restricted to EKS subnets"
-nc -z -w 3 "$MONGO_PUB" 22 && echo "22 open from internet (intentional weakness)"
+$NC "$MONGO_PUB" 27017 && echo "27017 OPEN (unexpected)" || echo "27017 closed from internet - restricted to EKS subnets"
+$NC "$MONGO_PUB" 22 && echo "22 open from internet (intentional weakness)"
 
 step "9. Audit logging is on (CloudTrail + EKS control plane)"
 aws cloudtrail get-trail-status --name "$PROJECT-trail" --query '{IsLogging:IsLogging,Latest:LatestDeliveryTime}'

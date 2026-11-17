@@ -52,7 +52,7 @@ jobs:
           "$GUARD" validate -d cloudformation/ -r policies/guard/ --show-summary fail
 
       - name: Checkov (posture findings incl. intentional weaknesses - reported, soft fail)
-        uses: bridgecrewio/checkov-action@c3e106d5f8f4253a6de5110efb41a080f83db294 # v12.3135.0
+        uses: bridgecrewio/checkov-action@3f0caf0c3aa9f56ade6b49f6e60b63aaeafb75a3 # v12.3141.0
         with:
           directory: cloudformation
           framework: cloudformation
